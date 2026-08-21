@@ -1,0 +1,28 @@
+# --- secrets ---
+.env
+.env.local
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- cloned repositories / local data ---
+.reposense-data/
+backend/data/
+
+# --- node / next.js ---
+node_modules/
+.next/
+out/
+dist/
+build/
+next-env.d.ts
+
+# --- editors / os ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

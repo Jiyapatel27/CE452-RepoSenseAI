@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+/* The scaffold shipped a prefers-color-scheme block that flips background and
+   foreground. For a simple, predictable demo UI we stay light-on-white so the
+   layout looks the same on every machine. */
+body {
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}

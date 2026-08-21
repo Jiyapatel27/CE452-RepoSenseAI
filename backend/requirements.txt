@@ -1,0 +1,27 @@
+# RepoSense AI - backend dependencies
+# Dependencies are added step-by-step as the pipeline grows.
+
+# --- Step 1: API + repository ingestion ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# --- Step 3: code chunking ---
+# Standalone LangChain splitter package - avoids pulling in the whole
+# `langchain` dependency tree, which we do not need.
+langchain-text-splitters==1.1.2
+
+# --- Step 4: local embeddings ---
+# Install CPU-only torch FIRST to avoid the much larger CUDA wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# then `pip install -r requirements.txt`. Keeps the venv near 1 GB instead of 2.5 GB.
+torch==2.13.0
+sentence-transformers==6.0.0
+
+# --- Step 5: Qdrant vector store ---
+qdrant-client==1.19.0
+
+# --- Step 7: Groq LLM ---
+groq==1.6.0
