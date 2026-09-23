@@ -26,6 +26,7 @@ from app.models.schemas import (
     RepositoryStatus,
     RepositoryStatusListResponse,
 )
+from app.db.repositories import StoredRepository, save_repository
 from app.services.chunker_service import ChunkSummary, iter_chunks
 from app.services.embedding_service import count_tokens
 from app.services.vector_store import IndexResult, index_chunks
@@ -70,6 +71,47 @@ def _chunk_stream(repo_path, files, repository, repository_id, settings, summary
         min_chunk_chars=settings.min_chunk_chars,
         length_function=count_tokens,
         summary=summary,
+    )
+
+
+def _persist_record(record: RepositoryRecord) -> None:
+    """Write a repository record to SQLite (Step 10)."""
+    summary = record.chunk_summary
+    save_repository(
+        StoredRepository(
+            repository_id=record.repository_id,
+            repository=record.repository,
+            owner=record.owner,
+            branch=record.branch,
+            html_url=record.html_url,
+            local_path=record.local_path,
+            status=record.status,
+            authenticated=record.authenticated,
+            indexed=record.indexed,
+            total_files_scanned=record.total_files_scanned,
+            supported_files=record.supported_files,
+            total_chunks=record.total_chunks,
+            language_counts=record.language_counts,
+            skipped_files=record.skipped_files,
+            parse_stats={
+                "files_parsed": record.parse_summary.files_parsed,
+                "files_failed": record.parse_summary.files_failed,
+                "total_lines": record.parse_summary.total_lines,
+                "total_characters": record.parse_summary.total_characters,
+            },
+            chunk_stats={
+                "total_chunks": summary.total_chunks,
+                "files_chunked": summary.files_chunked,
+                "files_without_chunks": summary.files_without_chunks,
+                "total_characters": summary.total_characters,
+                "min_chunk_chars": summary.min_chunk_chars,
+                "max_chunk_chars": summary.max_chunk_chars,
+                "total_tokens": summary.total_tokens,
+                "max_chunk_tokens": summary.max_chunk_tokens,
+                "chunks_per_language": summary.chunks_per_language,
+            },
+            analyzed_at=record.analyzed_at,
+        )
     )
 
 
@@ -197,6 +239,10 @@ async def analyze_repository(
             chunk_overlap=settings.chunk_overlap,
         )
     )
+
+    # Persist so the record survives a restart complete with its ingestion
+    # statistics - which cannot be rebuilt from Qdrant payloads.
+    await run_in_threadpool(_persist_record, record)
 
     logger.info(
         "Analysed %s: %d/%d files supported, %d parsed (%d lines), %d chunks, "

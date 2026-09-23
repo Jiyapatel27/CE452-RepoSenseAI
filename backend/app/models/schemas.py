@@ -379,6 +379,105 @@ class ChatResponse(BaseModel):
 
 
 # ----------------------------------------------------------------------
+# Step 12: conversations
+# ----------------------------------------------------------------------
+class StartConversationRequest(BaseModel):
+    repository_id: str = Field(..., description="Id returned by /analyze.")
+    question: str = Field(..., description="The opening question.")
+    top_k: int | None = Field(None, ge=1, le=20)
+    languages: list[str] | None = None
+
+
+class ContinueConversationRequest(BaseModel):
+    question: str = Field(..., description="Follow-up question.")
+    top_k: int | None = Field(None, ge=1, le=20)
+    languages: list[str] | None = None
+
+
+class RenameConversationRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+
+
+class MessageSourceResponse(BaseModel):
+    file_path: str
+    score: float | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    language: str | None = None
+    cited: bool = True
+
+
+class MessageResponse(BaseModel):
+    id: str
+    role: str
+    content: str
+    created_at: str
+    model: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    elapsed_ms: float | None = None
+    context_chunks: int | None = None
+    refused: bool = False
+    truncated: bool = False
+    resolved_question: str | None = Field(
+        None,
+        description=(
+            "The standalone question used for retrieval. Present only when a "
+            "follow-up had to be rewritten."
+        ),
+    )
+    sources: list[MessageSourceResponse] = Field(default_factory=list)
+
+
+class ConversationResponse(BaseModel):
+    id: str
+    repository_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int = 0
+    last_message: str | None = None
+
+
+class ConversationListResponse(BaseModel):
+    count: int
+    conversations: list[ConversationResponse]
+
+
+class ConversationDetailResponse(BaseModel):
+    conversation: ConversationResponse
+    messages: list[MessageResponse]
+
+
+class ConversationTurnResponse(BaseModel):
+    """The result of asking a question inside a thread."""
+
+    conversation: ConversationResponse
+    user_message: MessageResponse
+    assistant_message: MessageResponse
+    # Convenience mirrors of the assistant message, so a simple client does not
+    # have to dig into the message object.
+    answer: str
+    sources: list[str] = Field(default_factory=list)
+
+
+# ----------------------------------------------------------------------
+# Step 12: dashboard analytics
+# ----------------------------------------------------------------------
+class AnalyticsOverviewResponse(BaseModel):
+    overview: dict
+    activity: list[dict] = Field(
+        default_factory=list, description="Questions/answers/refusals per day."
+    )
+    repositories: list[dict] = Field(default_factory=list)
+    languages: dict[str, int] = Field(default_factory=dict)
+    top_files: list[dict] = Field(default_factory=list)
+    retrieval: dict = Field(default_factory=dict)
+    recent_questions: list[dict] = Field(default_factory=list)
+    system: dict = Field(default_factory=dict)
+
+
+# ----------------------------------------------------------------------
 # Errors
 # ----------------------------------------------------------------------
 class ErrorResponse(BaseModel):

@@ -85,6 +85,41 @@ class Settings(BaseSettings):
     github_token: str = ""
 
     # ------------------------------------------------------------------
+    # Phase 2 / Step 10: persistence
+    # ------------------------------------------------------------------
+    # SQLite, deliberately: chat history needs to survive a restart, and a
+    # single file needs no server, no container and no connection pooling.
+    # Lives beside the vectors so all local state is in one gitignored folder.
+    database_path: Path = (
+        BACKEND_DIR.parent / ".reposense-data" / "reposense.db"
+    )
+
+    # ------------------------------------------------------------------
+    # Step 11: conversational chat
+    # ------------------------------------------------------------------
+    # How many prior messages to feed back to the model. 6 is three exchanges -
+    # enough for follow-ups to resolve, bounded so a long thread cannot grow
+    # the prompt without limit.
+    chat_history_turns: int = 6
+
+    # Budget for rewriting a follow-up into a standalone question.
+    #
+    # This looks generous for a one-line output, and it has to be: gpt-oss is a
+    # REASONING model, so max_tokens covers its internal reasoning *and* the
+    # visible content. Measured on this exact prompt it emits ~565 characters
+    # of reasoning before the question. At 120 the whole budget went to
+    # reasoning, finish_reason came back "length", and content was EMPTY -
+    # which silently disabled condensation altogether. 512 leaves ample room
+    # (actual usage is ~135 tokens).
+    condense_max_tokens: int = 512
+
+    # Optional, model-specific. gpt-oss accepts "low" | "medium" | "high" and
+    # "low" roughly halves the reasoning tokens for a mechanical rewrite like
+    # condensation. Left empty by default because other models reject the
+    # parameter outright - set it only if your GROQ_MODEL supports it.
+    groq_reasoning_effort: str = ""
+
+    # ------------------------------------------------------------------
     # Step 5: Qdrant vector store
     # ------------------------------------------------------------------
     qdrant_url: str = "http://localhost:6333"

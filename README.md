@@ -6,10 +6,12 @@ Pipeline (built step by step):
 
 ```
 GitHub URL -> Download -> Filter -> Parse -> Chunk -> Embed -> Qdrant
-           -> Semantic Search -> Groq + Llama -> Grounded Answer -> Next.js UI
+           -> Semantic Search -> Groq LLM -> Grounded Answer -> Next.js UI
 ```
 
 ## Progress
+
+**Phase 1 — the RAG pipeline**
 
 | Step | Description | Status |
 |------|-------------|--------|
@@ -22,6 +24,49 @@ GitHub URL -> Download -> Filter -> Parse -> Chunk -> Embed -> Qdrant
 | 7 | Groq RAG (see model note) | Done |
 | 8 | Backend integration | Done |
 | 9 | Next.js UI | Done |
+
+**Phase 2 — chat, history and analytics**
+
+| Step | Description | Status |
+|------|-------------|--------|
+| 10 | SQLite persistence (conversations, messages, repositories) | Done |
+| 11 | Conversational RAG (multi-turn + query condensation) | Done |
+| 12 | Conversation + analytics APIs | Done |
+| 13–16 | Redesigned UI: shell, Import, Chat, Dashboard | Done |
+| 17 | Responsive layout, loading/empty states | Done |
+
+## Quick start
+
+Three terminals. Docker Desktop must be running first.
+
+```powershell
+# 1 - Qdrant (from the project root)
+docker compose up -d
+
+# 2 - backend
+cd backend
+.\run_dev.ps1
+
+# 3 - frontend
+cd frontend
+npm run dev
+```
+
+Then open **http://localhost:3000**.
+
+## Test suites
+
+Each step has a runnable checker. From `backend/`:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\check_step1.py     # ... through check_step12
+```
+
+| Needs nothing | Needs Qdrant | Needs Qdrant + Groq key |
+|---|---|---|
+| `check_step1` `check_step2` `check_step3` `check_step10` `check_private_repo` | `check_step5` `check_step6` | `check_step7` `check_step8` `check_step11` `check_step12` |
+
+(`check_step4` needs the embedding model, downloaded automatically on first run.)
 
 ---
 
@@ -1245,6 +1290,156 @@ frontend/
 
 ---
 
+# Phase 2
+
+## Step 10: SQLite persistence
+
+Chat history cannot live in memory, so state moved to a single SQLite file at
+`.reposense-data/reposense.db`. No server, no container, no new dependency
+(`sqlite3` is in the standard library).
+
+Tables: `repositories`, `conversations`, `messages`, `message_sources`. Sources
+are normalised rather than stored as JSON so the dashboard can answer
+"most-cited files" with a `GROUP BY`.
+
+**Three SQLite behaviours are handled explicitly**, because each one fails
+*silently*:
+
+1. **Foreign keys are OFF by default**, per connection. Without the pragma
+   `ON DELETE CASCADE` does nothing, and deleting a conversation orphans its
+   messages forever. `check_step10.py` deletes a thread and asserts
+   `message_sources` reached 0 — that assertion is the only thing that would
+   catch a regression.
+2. **Connections are not thread-safe**, and FastAPI runs sync work on arbitrary
+   threadpool workers. One connection is opened per operation.
+3. **The default journal mode blocks readers during a write.** WAL is enabled so
+   the dashboard can read while a chat message is being written.
+
+This also closed a Step 8 limitation: restoring from Qdrant recovered the file
+list but not the ingestion statistics, so `total_files_scanned` and the parse
+counts came back as 0. They now persist, and restore prefers SQLite, falling
+back to Qdrant only for repositories indexed before this step existed.
+
+## Step 11: Conversational RAG
+
+Multi-turn chat breaks naive retrieval:
+
+> **You:** Where is authentication implemented?
+> **AI:** In `auth.service.ts` and `auth.ts`…
+> **You:** *Where is it used?*
+
+Embedding "Where is it used?" retrieves noise — every meaningful word is a
+pronoun, and the subject exists only in the conversation. So each follow-up is
+first **condensed** into a standalone question, and only that is embedded:
+
+| Follow-up | Condensed to |
+|---|---|
+| `Where is it used?` | `Where is the JWT middleware used?` |
+| `What does that return?` | `What does the token creation function in auth.service.ts return?` |
+| `Why?` | `Why does auth.service.ts hash passwords with bcrypt?` |
+| `Where is the database connection initialized?` | *unchanged* |
+
+Measured effect on retrieval:
+
+```
+raw  "Where is it used?"  ->  article.service.test.ts, routes.ts, tag.service.test.ts
+condensed                 ->  auth.ts, token.utils.ts, tag.controller.ts
+```
+
+### The reasoning-model trap
+
+`condense_max_tokens` defaults to **512**, which looks generous for a one-line
+output. It has to be: `gpt-oss` is a **reasoning** model, so `max_tokens` covers
+its internal reasoning *and* the visible reply. At 120 the reasoning consumed the
+entire budget, `finish_reason` came back `length`, and **content was empty** —
+which silently disabled condensation while looking like the model "choosing not
+to rewrite". The consequence was real: retrieval fell back to the raw pronoun
+question and the model refused questions it had answered two turns earlier.
+
+Three defences now: a larger budget, a retry at 4× when content is empty *and*
+`finish_reason` is `length` (reasoning length is unbounded, so no fixed budget is
+ever safe), and an `ERROR` log on empty content — a silent fallback is worse than
+a crash.
+
+Prior turns are passed as real chat messages rather than flattened into one
+string, so the model sees who said what.
+
+## Step 12: Conversation + analytics APIs
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/conversations` | Start a thread and answer its first question |
+| `GET /api/conversations` | History sidebar (filterable by repository) |
+| `GET /api/conversations/{id}` | Full thread — resume |
+| `POST /api/conversations/{id}/messages` | Ask a follow-up |
+| `PATCH /api/conversations/{id}` | Rename |
+| `DELETE /api/conversations/{id}` | Delete (cascades) |
+| `GET /api/analytics/overview` | Everything the dashboard needs, one request |
+
+A thread's repository comes from the conversation, never the request, so it
+cannot silently switch codebases and make its earlier answers misleading.
+
+**A bug worth recording:** `start_conversation` creates the thread *before*
+attempting the answer, so every failure stranded an empty conversation. Four had
+accumulated — one per test run — and they surfaced on the dashboard as a phantom
+`nope__missing` repository. Failed starts now roll the thread back, and
+`check_step12.py` asserts no empty conversation survives.
+
+## Steps 13–17: The interface
+
+Next.js 16 App Router, React 19, Tailwind v4, plain JavaScript. A light sidebar
+shell with three pages.
+
+**Import** — URL plus a collapsible token field, stat tiles after indexing, and a
+list of previously indexed repositories with one-click chat.
+
+**Chat** — history sidebar with per-thread delete, repository switcher,
+suggestion chips, cited files inline. Follow-ups accept "it" and "that file", and
+the rewritten question is exposed under *"Searched for a rewritten question"* so a
+surprising retrieval can be explained rather than guessed at.
+
+**Dashboard** — stat tiles, questions/day, language breakdown, retrieval quality,
+most-cited files, per-repository table, recent questions, system panel.
+
+### Charts
+
+Colours were **validated, not chosen by eye** — the palette validator was run
+against the actual white card surface (CVD ΔE 24.7, all six checks pass). Most
+plots use a **single hue**, because the category labels already carry identity and
+a rainbow would add colour without information. The one two-colour plot (answered
+vs refused) direct-labels both bars, so colour is never the only channel. Axis and
+value text use ink tokens, never a series colour.
+
+The repository status badge derives from **Qdrant**, not the stored `indexed`
+flag: that flag records what the last analyze did, so a run with `auto_index`
+off marked a repository "not indexed" while its vectors were still searchable.
+
+### Rendering model output
+
+`components/AnswerText.js` handles the three constructs the model actually
+emits — `**bold**`, `` `inline code` ``, and `- ` bullets — plus fenced code
+blocks. It builds React elements rather than setting `innerHTML`, so model output
+cannot inject markup. Two subtleties found by looking at real answers:
+
+- The model **nests** them (``**`src/app/auth.ts`**``), so the bold branch
+  recurses once; a single pass left visible backticks inside bold text.
+- Answers about code routinely include ```` ```typescript ```` blocks. Without
+  fence handling they rendered as literal backticks with the indentation
+  flattened.
+
+### Responsive
+
+Measured, not assumed. Before: on a 390px screen the fixed 224px sidebar left
+`main` at **166px**, `/chat` overflowed to 601px, and the dashboard table
+overflowed to 875px *even on tablet*. After: no page-level overflow at 390 / 768
+/ 1280.
+
+The sidebar and chat history become drawers below their breakpoints. The
+repository table scrolls horizontally inside its own container rather than
+dropping columns — hiding columns would silently discard data.
+
+---
+
 ### Layout
 
 ```
@@ -1271,6 +1466,13 @@ backend/
     api/routes/vectorstore.py   /api/repository/index, /api/vectorstore/info
     api/routes/search.py        /api/search
     api/routes/chat.py          /api/chat
+    api/routes/conversations.py /api/conversations/*          (Phase 2)
+    api/routes/analytics.py     /api/analytics/overview       (Phase 2)
+    db/
+      database.py               connection, schema, pragmas
+      conversations.py          threads and messages
+      repositories.py           repository metadata
+      analytics.py              dashboard aggregations
   scripts/check_step1.py        offline URL-validation checks
   scripts/check_step2.py        offline scan + parse checks
   scripts/check_step3.py        offline chunking checks
@@ -1279,12 +1481,29 @@ backend/
   scripts/check_step6.py        search API checks (needs the container)
   scripts/check_step7.py        RAG grounding checks (needs Qdrant + Groq key)
   scripts/check_step8.py        integration + restart-restore checks
+  scripts/check_step10.py       SQLite persistence (temp db, offline)
+  scripts/check_step11.py       conversational RAG + condensation
+  scripts/check_step12.py       conversation + analytics APIs
   scripts/check_private_repo.py offline token/redaction checks
   run_dev.ps1                   dev server launcher
   requirements.txt
   .env.example
+frontend/
+  app/
+    layout.js                   wraps every page in the shell
+    page.js                     Import
+    chat/page.js                Chat + history
+    dashboard/page.js           Dashboard
+    globals.css                 palette, scrollbars, one animation
+  components/
+    Shell.js                    sidebar nav + health footer
+    ui.js                        Button, Card, Stat, Badge, Empty, ...
+    charts.js                   inline-SVG charts (validated palette)
+    AnswerText.js               minimal Markdown renderer
+  lib/api.js                    backend client
 docker-compose.yml              Qdrant container
 .reposense-data/
   repos/                        cloned repositories (gitignored)
   qdrant/                       vector storage (gitignored)
+  reposense.db                  SQLite: history + metadata (gitignored)
 ```

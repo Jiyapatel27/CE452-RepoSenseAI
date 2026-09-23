@@ -7,6 +7,7 @@ files on disk survive).
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -90,6 +91,98 @@ class RepositoryStore:
 repository_store = RepositoryStore()
 
 
+def restore_repositories() -> dict[str, int]:
+    """Rebuild the in-memory store on startup, best source first.
+
+    SQLite has the complete picture (including ingestion statistics that exist
+    nowhere else), so it wins. Qdrant is then used only for repositories that
+    have vectors but no database row - which happens for anything indexed
+    before Step 10 added persistence.
+    """
+    from_database = restore_from_database()
+    from_vectors = restore_from_vector_store()
+    return {"from_database": from_database, "from_vectors": from_vectors}
+
+
+def restore_from_database() -> int:
+    """Load repository records from SQLite. Returns how many were restored."""
+    from app.db.repositories import list_repositories
+
+    restored = 0
+    for stored in list_repositories():
+        if repository_store.get(stored.repository_id) is not None:
+            continue
+
+        repo_root = Path(stored.local_path)
+        # Rebuild the file list from disk so /chunks and /file keep working.
+        # The clone may be gone (user cleared .reposense-data), in which case
+        # those endpoints correctly report 410 rather than crashing.
+        files = _scan_files_if_present(repo_root)
+
+        parse_summary = ParseSummary(
+            files_parsed=stored.parse_stats.get("files_parsed", 0),
+            files_failed=stored.parse_stats.get("files_failed", 0),
+            total_lines=stored.parse_stats.get("total_lines", 0),
+            total_characters=stored.parse_stats.get("total_characters", 0),
+        )
+        chunk_summary = ChunkSummary(
+            total_chunks=stored.total_chunks,
+            files_chunked=stored.chunk_stats.get("files_chunked", 0),
+            files_without_chunks=stored.chunk_stats.get("files_without_chunks", 0),
+            total_characters=stored.chunk_stats.get("total_characters", 0),
+            max_chunk_chars=stored.chunk_stats.get("max_chunk_chars", 0),
+            min_chunk_chars=stored.chunk_stats.get("min_chunk_chars", 0),
+            total_tokens=stored.chunk_stats.get("total_tokens", 0),
+            max_chunk_tokens=stored.chunk_stats.get("max_chunk_tokens", 0),
+            chunks_per_language=stored.chunk_stats.get("chunks_per_language", {}),
+        )
+
+        repository_store.save(
+            RepositoryRecord(
+                repository_id=stored.repository_id,
+                repository=stored.repository,
+                owner=stored.owner,
+                branch=stored.branch,
+                html_url=stored.html_url,
+                local_path=stored.local_path,
+                status=stored.status,
+                total_files_scanned=stored.total_files_scanned,
+                files=files,
+                skipped_files=stored.skipped_files,
+                language_counts=stored.language_counts,
+                truncated=False,
+                authenticated=stored.authenticated,
+                analyzed_at=stored.analyzed_at,
+                parse_summary=parse_summary,
+                chunk_summary=chunk_summary,
+                indexed=stored.indexed,
+            )
+        )
+        restored += 1
+
+    return restored
+
+
+def _scan_files_if_present(repo_root: Path) -> list[DiscoveredFile]:
+    """Re-walk a clone to rebuild its file list, or [] if it is gone."""
+    if not repo_root.exists():
+        return []
+    try:
+        from app.config import get_settings as _get_settings
+        from app.services.github_service import scan_repository_files
+
+        settings = _get_settings()
+        return scan_repository_files(
+            repo_root,
+            max_file_size_bytes=settings.max_file_size_bytes,
+            max_files=settings.max_files_per_repo,
+        ).files
+    except Exception as exc:  # noqa: BLE001 - restore must not fail on this
+        logger = __import__("logging").getLogger(__name__)
+        logger.warning("Could not re-scan %s: %s", repo_root, exc)
+        return []
+
+
 def restore_from_vector_store() -> int:
     """Rebuild repository records from Qdrant. Returns how many were restored.
 
@@ -153,9 +246,63 @@ def restore_from_vector_store() -> int:
                 indexed=True,
             )
         )
+
+        # Backfill a metadata row so this repository stops being invisible to
+        # anything that reads SQLite (the dashboard's per-repository panel).
+        # The statistics Qdrant cannot provide stay zero and the status says
+        # "restored", so the record never pretends to be complete.
+        _backfill_metadata(
+            repository_id=summary.repository_id,
+            repository=summary.repository,
+            owner=owner,
+            name=name,
+            local_path=str(repo_root),
+            files=files,
+            language_counts=language_counts,
+            total_chunks=summary.chunk_count,
+        )
         restored += 1
 
     return restored
+
+
+def _backfill_metadata(
+    *,
+    repository_id: str,
+    repository: str,
+    owner: str,
+    name: str,
+    local_path: str,
+    files: list[DiscoveredFile],
+    language_counts: dict[str, int],
+    total_chunks: int,
+) -> None:
+    """Write a partial metadata row for a Qdrant-only repository."""
+    from app.db.repositories import StoredRepository, get_repository, save_repository
+
+    if get_repository(repository_id) is not None:
+        return  # a real row already exists; never downgrade it
+
+    try:
+        save_repository(
+            StoredRepository(
+                repository_id=repository_id,
+                repository=repository,
+                owner=owner,
+                html_url=f"https://github.com/{owner}/{name or repository}",
+                local_path=local_path,
+                status="restored",
+                indexed=True,
+                supported_files=len(files),
+                total_chunks=total_chunks,
+                language_counts=language_counts,
+                chunk_stats={"total_chunks": total_chunks},
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - restore must not fail on this
+        logging.getLogger(__name__).warning(
+            "Could not backfill metadata for %s: %s", repository_id, exc
+        )
 
 
 def _file_size(path: Path) -> int:

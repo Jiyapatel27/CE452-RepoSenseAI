@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
 
 from groq import (
     APIConnectionError,
@@ -67,11 +68,17 @@ def complete(
     system_prompt: str,
     user_prompt: str,
     *,
+    history: list[dict[str, str]] | None = None,
     model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> LLMReply:
     """Send one chat completion request to Groq.
+
+    `history` is a list of prior `{"role", "content"}` turns, inserted between
+    the system prompt and the new question. Passing real conversation turns
+    rather than flattening them into one string lets the model see who said
+    what - which is what makes "it" and "that file" resolvable in a follow-up.
 
     Every failure mode is translated into a typed error so the API returns a
     useful status code instead of a 500 with a stack trace.
@@ -80,17 +87,27 @@ def complete(
     client = get_groq_client()
     model_name = model or settings.groq_model
 
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for turn in history or []:
+        # Guard against anything unexpected reaching the API: Groq rejects
+        # roles outside this set, and a stray one would 400 the whole request.
+        if turn.get("role") in {"user", "assistant"} and turn.get("content"):
+            messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": user_prompt})
+
+    extra: dict[str, Any] = {}
+    if settings.groq_reasoning_effort:
+        extra["reasoning_effort"] = settings.groq_reasoning_effort
+
     try:
         response = client.chat.completions.create(
             model=model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             temperature=(
                 temperature if temperature is not None else settings.groq_temperature
             ),
             max_tokens=max_tokens or settings.groq_max_tokens,
+            **extra,
         )
     except AuthenticationError as exc:
         raise LLMNotConfiguredError(
@@ -123,9 +140,26 @@ def complete(
 
     choice = response.choices[0]
     usage = response.usage
+    content = (choice.message.content or "").strip()
+
+    # A reasoning model spends max_tokens on reasoning *before* it writes
+    # anything, so too small a budget yields finish_reason="length" with
+    # EMPTY content. That is silent and very confusing downstream - a caller
+    # with a fallback path just quietly stops working. Say so loudly.
+    if not content:
+        logger.error(
+            "Groq returned EMPTY content (model=%s, finish_reason=%s, "
+            "completion_tokens=%s, max_tokens=%s). For a reasoning model this "
+            "usually means max_tokens was too small: the budget covers "
+            "reasoning as well as the reply. Raise it.",
+            response.model,
+            choice.finish_reason,
+            getattr(usage, "completion_tokens", "?"),
+            max_tokens or settings.groq_max_tokens,
+        )
 
     return LLMReply(
-        content=(choice.message.content or "").strip(),
+        content=content,
         model=response.model,
         prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
         completion_tokens=getattr(usage, "completion_tokens", 0) or 0,

@@ -98,6 +98,13 @@ class LLMUnavailableError(RepoSenseError):
     error_code = "llm_unavailable"
 
 
+class ConversationNotFoundError(RepoSenseError):
+    """No chat thread with that id."""
+
+    status_code = 404
+    error_code = "conversation_not_found"
+
+
 class InvalidSearchQueryError(RepoSenseError):
     status_code = 400
     error_code = "invalid_search_query"

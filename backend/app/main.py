@@ -10,7 +10,15 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import chat, embeddings, repository, search, vectorstore
+from app.api.routes import (
+    analytics,
+    chat,
+    conversations,
+    embeddings,
+    repository,
+    search,
+    vectorstore,
+)
 from app.config import get_settings
 from app.core.exceptions import RepoSenseError
 
@@ -50,20 +58,32 @@ async def lifespan(_: FastAPI):
             info.device,
         )
 
-    # Rebuild repository records from Qdrant. The vectors outlive this process,
-    # so without it a restarted server would answer "no analysed repository"
-    # for code it can already search. Never fatal - a missing Qdrant just means
-    # nothing to restore, and /analyze still works.
-    try:
-        from app.services.repository_store import restore_from_vector_store
+    # Create the SQLite schema before anything reads it.
+    from app.db.database import init_database
 
-        restored = await run_in_threadpool(restore_from_vector_store)
-        if restored:
-            logger.info("Restored %d repository record(s) from Qdrant", restored)
+    await run_in_threadpool(init_database)
+
+    # Rebuild repository records so a restarted server does not claim it knows
+    # nothing about code it can already search. SQLite is authoritative;
+    # Qdrant covers anything indexed before persistence existed. Never fatal -
+    # /analyze still works if this finds nothing.
+    try:
+        from app.services.repository_store import restore_repositories
+
+        restored = await run_in_threadpool(restore_repositories)
+        total = restored["from_database"] + restored["from_vectors"]
+        if total:
+            logger.info(
+                "Restored %d repository record(s) (%d from database, "
+                "%d from Qdrant only)",
+                total,
+                restored["from_database"],
+                restored["from_vectors"],
+            )
         else:
-            logger.info("No indexed repositories found in Qdrant")
+            logger.info("No previously analysed repositories found")
     except Exception as exc:  # noqa: BLE001 - startup must not fail on this
-        logger.warning("Could not restore repositories from Qdrant: %s", exc)
+        logger.warning("Could not restore repositories: %s", exc)
 
     yield
 
@@ -103,6 +123,8 @@ app.include_router(embeddings.router)
 app.include_router(vectorstore.router)
 app.include_router(search.router)
 app.include_router(chat.router)
+app.include_router(conversations.router)
+app.include_router(analytics.router)
 
 
 @app.get("/health", tags=["meta"])
